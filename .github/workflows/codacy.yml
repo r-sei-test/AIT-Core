@@ -30,93 +30,70 @@
 name: Codacy Security Scan
 
 on:
-  # Run on PRs to surface issues before merge.
   pull_request:
-    branches: [ "**" ]                 # tune to your branching model
+    branches: [ "**" ]
     paths:
-      - "**/*"                         # narrow to your ecosystems for speed
+      - "**/*"
       - ".github/workflows/codacy.yml"
-
-  # Also run on pushes so direct commits are covered.
   push:
     branches: [ "**" ]
     paths:
       - "**/*"
       - ".github/workflows/codacy.yml"
-
-  # Optional weekly drift check; adjust cadence as needed.
   schedule:
     - cron: "16 7 * * 2"
-
-  # Manual trigger (useful during setup/testing).
   workflow_dispatch:
 
-# Cancel older in-flight runs for the same ref/PR (prevents CI pile-ups).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
 
-# Default-deny at the workflow level (read-only).
 permissions:
   contents: read
 
-# Safe shell defaults for all 'run:' steps.
 defaults:
   run:
     shell: bash -Eeuo pipefail {0}
 
 jobs:
-  # ────────────────────────────── Job 1: Scan + Split ──────────────────────────────
+  # ────────────────────────────── Job 1: Scan + Split + Validate ──────────────────────────────
   codacy-scan:
-    name: Codacy scan -> split SARIF
-    runs-on: ubuntu-24.04                  # explicit runner for reproducibility
+    name: Codacy scan → split → validate SARIF
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
-
-    # Least privilege: only what's needed to read the repo (and optional actions:read).
     permissions:
       contents: read
       actions: read
 
-    # Make outputs available to the next job (JSON array describing per-run SARIFs).
+    # Expose the FINAL, validated list of files to the next job.
     outputs:
-      sarif_files: ${{ steps.split.outputs.sarif_files }}
+      sarif_files: ${{ steps.validate.outputs.sarif_files_valid }}
 
     env:
-      # Single source of truth for initial Codacy SARIF location.
-      SARIF_OUT: results.sarif
+      SARIF_OUT: results.sarif  # initial Codacy SARIF path
 
     steps:
-      # Harden the ephemeral runner’s egress. Start with audit; switch to 'block' + allowlist later.
       - name: Harden runner (egress audit)
         uses: step-security/harden-runner@f4a75cfd619ee5ce8d5b864b0d183aff3c69b55a # v2.13.1
         with:
           egress-policy: audit
-          # Example when moving to block:
-          # allowed-endpoints: >
-          #   api.github.com:443
-          #   uploads.github.com:443
-          #   objects.githubusercontent.com:443
-          #   github.com:443
-          #   ghcr.io:443
 
-      # Checkout with no persisted credentials (we never push in this workflow).
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-          fetch-depth: 0                    # some analyzers prefer full history
+          fetch-depth: 0
 
-      # ───── Codacy CLI v2: install (pinned), init, install tools, analyze -> SARIF ─────
+      # Install Codacy CLI v2 from a pinned release asset.
       - name: Install Codacy CLI v2 (pinned)
         run: |
-          VER="1.0.0-main.356.sha.ee1b0e6"   # pin to a specific v2 tag
+          VER="1.0.0-main.356.sha.ee1b0e6"
           curl -fsSL -o /tmp/ccli.tgz \
             "https://github.com/codacy/codacy-cli-v2/releases/download/${VER}/codacy-cli-v2_${VER}_linux_amd64.tar.gz"
           sudo tar -xzf /tmp/ccli.tgz -C /usr/local/bin codacy-cli-v2
           sudo mv /usr/local/bin/codacy-cli-v2 /usr/local/bin/codacy-cli
           codacy-cli version
 
-      # Derive owner/repo from GITHUB_REPOSITORY for remote init.
       - name: Resolve repository coordinates for Codacy
         id: coords
         run: |
@@ -125,7 +102,6 @@ jobs:
           echo "owner=${OWNER}" >> "$GITHUB_OUTPUT"
           echo "repo=${REPO}"   >> "$GITHUB_OUTPUT"
 
-      # Initialize configuration.
       - name: Codacy CLI v2 init (remote if token present; else local)
         env:
           CODACY_API_TOKEN: ${{ secrets.CODACY_API_TOKEN }}
@@ -141,19 +117,27 @@ jobs:
             codacy-cli init
           fi
 
-      # Install toolchains/runtimes required by the generated .codacy/codacy.yaml
       - name: Codacy CLI v2 install toolchains
         run: codacy-cli install
 
-      # Run Codacy Analysis CLI. 
-      - name: Run Codacy Analysis CLI -> SARIF
+      - name: Run Codacy Analysis CLI → SARIF
         continue-on-error: true
         env:
           SARIF_OUT: ${{ env.SARIF_OUT }}
         run: |
-          codacy-cli analyze --format sarif -o "${SARIF_OUT:-results.sarif}"
+          codacy-cli analyze --format sarif -o "${SARIF_OUT}"
 
-      # Split multi-run SARIF -> many single-run SARIFs (one per analyzer) under ./reports.
+      - name: Inspect SARIF (runs/results summary)
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y jq >/dev/null
+          BYTES=$(wc -c < "${SARIF_OUT}" || echo 0)
+          echo "SARIF size (bytes): ${BYTES}"
+          if [[ "${BYTES}" -gt 0 ]]; then
+            echo -e "Runs\tTool\tResults"
+            jq -r '(.runs // []) | to_entries[] | "\(.key+1)\t\(.value.tool.driver.name // "unknown")\t\((.value.results|length))"' "${SARIF_OUT}" || true
+          fi
+
+      # Split multi-run SARIF → single-run files (preserve the run; normalize missing fields only).
       - name: Split SARIF into single-run files
         id: split
         run: |
@@ -164,16 +148,8 @@ jobs:
             exit 0
           fi
 
-          # Quick visibility: size + tools present (jq optional)
-          echo "RESULTS SIZE (bytes): $(wc -c < "${SARIF_OUT}")"
-          if command -v jq >/dev/null 2>&1; then
-            jq -r '.runs[].tool.driver.name // "unknown-tool"' "${SARIF_OUT}" | nl -ba || true
-          else
-            echo "jq not available; skipping tool list."
-          fi
-
           python - <<'PY'
-          import json, os, re, pathlib, hashlib
+          import json, os, re, pathlib, hashlib, copy
           sarif_path = os.environ.get("SARIF_OUT", "results.sarif")
           outdir = pathlib.Path("reports"); outdir.mkdir(parents=True, exist_ok=True)
 
@@ -185,24 +161,23 @@ jobs:
 
           files = []
           runs = data.get("runs", [])
-          for i, run in enumerate(runs, 1):
-              # Normalize tool
-              tool = run.get("tool") or {}
+          for i, original_run in enumerate(runs, 1):
+              run = copy.deepcopy(original_run)
+
+              # Normalize only if missing
+              tool   = run.get("tool") or {}
               driver = tool.get("driver") or {}
-              name = driver.get("name") or f"run{i}"
+              name   = driver.get("name") or f"run{i}"
               driver["name"] = name
-              # Ensure arrays exist
               if driver.get("rules") is None:
                   driver["rules"] = []
               if run.get("results") is None:
                   run["results"] = []
+              tool["driver"] = driver
+              run["tool"] = tool
 
-              run["tool"] = {"driver": driver}
-
-              # Build one-run SARIF
               out_doc = {"version": version, "$schema": schema, "runs": [run]}
 
-              # Stable, unique category (tool + index + short hash of tool name)
               slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-").lower() or f"run{i}"
               sh = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
               category = f"codacy-{slug}-{i}-{sh}"
@@ -213,15 +188,91 @@ jobs:
 
               files.append({"file": str(outfile), "category": category})
 
-          # Always emit an array (possibly empty if no runs)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as go:
               go.write("sarif_files=" + json.dumps(files) + "\n")
-
-          print(f"Emitted {len(files)} single-run SARIF file(s).")
           PY
 
-      # Archive the split SARIFs for auditing and for the next job to download.
-      - name: Upload split SARIFs as artifact
+      # VALIDATE and minimally REPAIR the split SARIF files.
+      # - Downloads the SARIF 2.1.0 schema, validates each file.
+      # - Repairs missing: version, $schema, tool.driver.name, rules[], results[].
+      # - Emits a filtered list of VALID files (preserving original categories).
+      - name: Validate and repair split SARIFs
+        id: validate
+        env:
+          SPLIT_JSON: ${{ steps.split.outputs.sarif_files }}
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y jq >/dev/null
+          python - <<'PY'
+          import json, os, pathlib, urllib.request, sys
+          from jsonschema import Draft202012Validator
+
+          split = json.loads(os.environ.get("SPLIT_JSON","[]"))
+          out_valid = []
+          invalid = []
+
+          schema_url = "https://json.schemastore.org/sarif-2.1.0.json"
+          schema_path = pathlib.Path("sarif-2.1.0.json")
+          with urllib.request.urlopen(schema_url) as r:
+            schema_path.write_bytes(r.read())
+          schema = json.loads(schema_path.read_text("utf-8"))
+          validator = Draft202012Validator(schema)
+
+          def repair(doc):
+            # Minimal, safe defaults only
+            if doc.get("version") != "2.1.0":
+              doc["version"] = "2.1.0"
+            if "$schema" not in doc or not isinstance(doc["$schema"], str):
+              doc["$schema"] = "https://json.schemastore.org/sarif-2.1.0.json"
+            runs = doc.get("runs")
+            if not isinstance(runs, list) or len(runs) == 0:
+              doc["runs"] = [{"tool": {"driver": {"name": "unknown"}},"results": []}]
+              return
+            run = runs[0]
+            tool = run.get("tool") or {}
+            driver = tool.get("driver") or {}
+            if not isinstance(driver.get("name"), str) or not driver["name"]:
+              driver["name"] = "unknown"
+            if driver.get("rules") is None:
+              driver["rules"] = []
+            if run.get("results") is None or not isinstance(run.get("results"), list):
+              run["results"] = []
+            tool["driver"] = driver
+            run["tool"] = tool
+            doc["runs"][0] = run
+
+          for item in split:
+            path = pathlib.Path(item["file"])
+            try:
+              doc = json.loads(path.read_text("utf-8"))
+            except Exception as e:
+              invalid.append((str(path), f"read/parse error: {e}")); continue
+
+            # Try as-is
+            errors = sorted(validator.iter_errors(doc), key=lambda e: e.path)
+            if errors:
+              # Attempt minimal repair and re-validate
+              repair(doc)
+              errors = sorted(validator.iter_errors(doc), key=lambda e: e.path)
+              if errors:
+                invalid.append((str(path), f"{len(errors)} schema error(s)"))
+                continue
+              # Write repaired doc back
+              path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+            out_valid.append(item)
+
+          # Emit outputs
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as go:
+            go.write("sarif_files_valid="+json.dumps(out_valid)+"\n")
+
+          print(f"VALID: {len(out_valid)} file(s)")
+          if invalid:
+            print("INVALID (skipped):")
+            for p, why in invalid:
+              print(f" - {p}: {why}")
+          PY
+
+      - name: Upload split (and fixed) SARIFs as artifact
         if: always() && hashFiles('reports/*.sarif') != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -233,22 +284,19 @@ jobs:
   upload-to-code-scanning:
     name: Upload single-run SARIFs
     needs: codacy-scan
-    # Run only when the split step produced at least one file.
     if: ${{ needs.codacy-scan.outputs.sarif_files != '' && needs.codacy-scan.outputs.sarif_files != '[]' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-
-    # Least privilege: this job alone needs 'security-events: write' to upload SARIF.
     permissions:
       contents: read
       security-events: write
-      actions: read                     # used in some private-repo setups
+      actions: read
 
     strategy:
       fail-fast: false
       matrix:
         item: ${{ fromJson(needs.codacy-scan.outputs.sarif_files) }}
-        # Each "item" is {"file":"reports/codacy-<tool>...sarif","category":"codacy-<tool>-<i>-<hash>"}
+        # {"file":"reports/<category>.sarif","category":"codacy-<tool>-<i>-<hash>"}
 
     steps:
       - name: Harden runner (egress audit)
@@ -256,18 +304,22 @@ jobs:
         with:
           egress-policy: audit
 
-      # Pull down the split SARIFs created in Job 1.
       - name: Download split SARIFs
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: codacy-sarif-split
           path: reports
 
-      # Optional: quick listing for visibility.
-      - name: List split SARIFs
-        run: ls -lh reports || true
+      - name: List split SARIFs (debug)
+        run: |
+          ls -lh reports || true
+          if command -v jq >/dev/null 2>&1; then
+            for f in reports/*.sarif; do
+              echo "---- $f"
+              jq -r '[.runs[0].tool.driver.name, (.runs[0].results|length)] | @tsv' "$f" || true
+            done
+          fi
 
-      # Upload one run per upload+category, per GitHub policy.
       - name: Upload SARIF (single run)
         uses: github/codeql-action/upload-sarif@192325c86100d080feab897ff886c34abd4c83a3 # v3.30.3
         with:
