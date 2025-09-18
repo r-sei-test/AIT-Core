@@ -1,0 +1,182 @@
+# Dependency Review (PRs and Pushes) — hardened
+# =============================================================================
+# What this workflow does:
+#   - On PRs that change dependency manifests: runs GitHub’s Dependency Review,
+#     annotates the PR, and (optionally) provide a summary.
+#   - On pushes to main (or chosen branches): compares the new commit to
+#     the previous one to catch vulnerable upgrades outside PRs.
+#
+# Key practices:
+#   - Default-deny permissions at workflow level; jobs elevate only what they need.
+#   - Pin third-party actions to commit SHAs (reproducible, tamper-resistant).
+#   - Guard untrusted PRs (use pull_request, not pull_request_target).
+#   - Concurrency cancels superseded runs to avoid CI pile-ups.
+#   - Timeouts cap spend and fail fast.
+#   - Harden egress with StepSecurity.
+#   - Scoped checkout credentials.
+#   - Trigger only when dependency files or this workflow change.
+
+name: Dependency review
+
+on:
+  pull_request:
+    branches: [ "**" ] # [ "main" ]                  
+    # Run only if dependency manifests change (adjust for your ecosystems)
+    paths:
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/yarn.lock"
+      - "**/pnpm-lock.yaml"
+      - "**/pom.xml"
+      - "**/build.gradle"
+      - "**/build.gradle.kts"
+      - "**/gradle.lockfile"
+      - "**/go.mod"
+      - "**/go.sum"
+      - "**/requirements*.txt"
+      - "**/Pipfile"
+      - "**/Pipfile.lock"
+      - "**/pyproject.toml"
+      - "**/poetry.lock"
+      - "**/Gemfile"
+      - "**/Gemfile.lock"
+      - "**/composer.json"
+      - "**/composer.lock"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/dependency-review.yml"
+
+  # Also run on pushes (e.g., to main) so direct commits are covered
+  push:
+    branches: [ "**" ] # [ "main" ]
+    paths:
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/yarn.lock"
+      - "**/pnpm-lock.yaml"
+      - "**/pom.xml"
+      - "**/build.gradle"
+      - "**/build.gradle.kts"
+      - "**/gradle.lockfile"
+      - "**/go.mod"
+      - "**/go.sum"
+      - "**/requirements*.txt"
+      - "**/Pipfile"
+      - "**/Pipfile.lock"
+      - "**/pyproject.toml"
+      - "**/poetry.lock"
+      - "**/Gemfile"
+      - "**/Gemfile.lock"
+      - "**/composer.json"
+      - "**/composer.lock"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/dependency-review.yml"
+
+  workflow_dispatch:                      # manual run for testing
+
+# Cancel older in-flight runs on the same ref/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+# Default-deny: read-only by default
+permissions:
+  contents: read
+
+jobs:
+  # ---------------- PR job: comments allowed (needs pull-requests: write) ----------------
+  dependency-review-pr:
+    if: ${{ github.event_name == 'pull_request' }}
+    name: Dependency review (PR)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Least privilege for PRs:
+    # - contents: write -> needed for snapshot submission in this job
+    # - pull-requests: write -> to post a summary comment (optional)
+    permissions:
+      contents: write 
+      pull-requests: write
+
+    steps:
+      - name: Harden runner (egress audit)
+        uses: step-security/harden-runner@f4a75cfd619ee5ce8d5b864b0d183aff3c69b55a # v2.13.1
+        with:
+          egress-policy: audit
+          # Later, prefer:
+          # egress-policy: block
+          # allowed-endpoints: >
+          #   api.github.com:443
+          #   github.com:443
+          #   objects.githubusercontent.com:443
+
+      - name: Checkout repository 
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Dependency Review on PRs uses the PR’s base/head automatically.
+      - name: Dependency Review (PR)
+        uses: actions/dependency-review-action@595b5aeba73380359d98a5e087f648dbb0edce1b # v4.7.3
+        with:
+          comment-summary-in-pr: always     # requires pull-requests: write
+          # Enforcement knobs (uncomment to gate merges):
+          # fail-on-severity: low      # block if any vuln >= low
+          # fail-on-cvss: 5                 # or gate by CVSS score
+          # deny-licenses: GPL-1.0-or-later, LGPL-2.0-or-later
+          # allow-licenses: MIT, Apache-2.0, BSD-3-Clause
+          # allow-ghsas: GHSA-xxxx-...,GHSA-yyyy-...   # fine-grained allowlist
+          # deny-ghsas:  GHSA-zzzz-...                 # fine-grained denylist
+          retry-on-snapshot-warnings: true           # Maven snapshots
+          retry-on-snapshot-warnings-timeout: 180
+
+          # ---------------- Warning-only posture; still show rich signals ----------------
+          fail-on-scopes: runtime,development,unknown  # include dev/test deps in analysis (no fail unless gates above are enabled)
+          license-check: true                       # report license info; fails only if allow/deny-licenses are set
+          show-openssf-scorecard: true              # surface Scorecard signals in summary
+          warn-on-openssf-scorecard-level: 5        # emit warnings when Scorecard < 5/10
+
+  # ---------------- Push job: no PR comment (tighter permissions) ----------------
+  dependency-review-push:
+    if: ${{ github.event_name == 'push' }}
+    name: Dependency review (push)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write   # needed for snapshot submission on push
+
+    steps:
+      - name: Harden runner 
+        uses: step-security/harden-runner@f4a75cfd619ee5ce8d5b864b0d183aff3c69b55a # v2.13.1
+        with:
+          egress-policy: audit
+
+      # We need at least the previous commit for a diff; fetch-depth: 2 is enough.
+      - name: Checkout repository 
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      # Run Dependency Review comparing base->head on push
+      - name: Dependency Review (push)
+        if: ${{ github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' }}
+        uses: actions/dependency-review-action@595b5aeba73380359d98a5e087f648dbb0edce1b # v4.7.3
+        with:
+          base-ref: ${{ github.event.before }}  # previous commit from push payload
+          head-ref: ${{ github.sha }}           # current commit from push payload
+          comment-summary-in-pr: never      # not a PR; no comment
+          # Enforcement knobs (uncomment to gate merges/commits in the future):
+          # fail-on-severity: low            # block on any known vuln
+          # fail-on-cvss: 5                  # or gate by CVSS score
+          # deny-licenses: GPL-1.0-or-later, LGPL-2.0-or-later
+          # allow-licenses: MIT, Apache-2.0, BSD-3-Clause
+          retry-on-snapshot-warnings: true
+          retry-on-snapshot-warnings-timeout: 180
+
+          # ---------------- Warning-only posture; still show rich signals ----------------
+          fail-on-scopes: runtime,development,unknown  # include dev/test deps in analysis (no fail unless gates above are enabled)
+          license-check: true                       # report license info; fails only if allow/deny-licenses are set
+          show-openssf-scorecard: true              # surface Scorecard signals in summary
+          warn-on-openssf-scorecard-level: 5        # emit warnings when Scorecard < 5/10
