@@ -1,0 +1,134 @@
+# ==============================================================================
+# Workflow: Codacy Security Scan (hardened, reproducible)
+# What this does (high level):
+#   1) Checks out code with read-only, non-persistent credentials.
+#   2) Runs Codacy Analysis CLI (via pinned GitHub Action) to produce SARIF.
+#   3) Publishes the SARIF as a short-lived artifact.
+#   4) Uploads SARIF to GitHub Code Scanning from a separate job that has
+#      only the needed write scope ("security-events: write").
+#
+# Why this structure:
+#   - Default-deny: top-level token is read-only; only the upload job can write.
+#   - Pinned actions: commit SHAs for tamper resistance + reproducibility.
+#   - Guard untrusted PRs: still uses `pull_request` (not `*_target`).
+#   - Concurrency: cancels superseded runs to save spend.
+#   - Timeouts: fail fast on hangs.
+#   - Network hardening: StepSecurity egress audit (switch to block later).
+#   - Explicit runner: ubuntu-24.04 for stability.
+#   - Auditable: SARIF saved as artifact with retention.
+# ==============================================================================
+
+name: Codacy Security Scan
+
+on:
+  push:
+    branches: [ "**" ] # [ "main" ]
+  pull_request:
+    branches: [ "**" ] # [ "main" ]
+  schedule:
+    - cron: "16 7 * * 2"   # weekly drift check (Tue 07:16)
+  workflow_dispatch:        # manual runs for setup/debugging
+
+# Default-deny: make the workflow token read-only by default.
+permissions:
+  contents: read
+
+# Cancel older in-flight runs on the same ref to prevent CI pile-ups.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Safe shell defaults for all run steps.
+defaults:
+  run:
+    shell: bash -Eeuo pipefail {0}
+
+jobs:
+  # ───────────────────────────── Job 1: Scan (read-only) ─────────────────────────────
+  scan:
+    name: Codacy scan -> produce SARIF
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    # Least privilege for this job: it only reads code and writes an artifact.
+    permissions:
+      contents: read
+      actions: read   # sometimes required in private repos for status reads
+
+    steps:
+      # Harden the ephemeral runner's outbound connections.
+      - name: Harden runner (egress audit)
+        uses: step-security/harden-runner@f4a75cfd619ee5ce8d5b864b0d183aff3c69b55a # v2.13.1
+        with:
+          egress-policy: audit
+          # Once stable, prefer:
+          # egress-policy: block
+          # allowed-endpoints: >
+          #   api.github.com:443
+          #   uploads.github.com:443
+          #   objects.githubusercontent.com:443
+          #   github.com:443
+
+      # Checkout without persisting Git credentials (this job never pushes).
+      - name: Checkout repository (pinned)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # full history can help certain analyzers
+
+      # Run Codacy Analysis CLI via the official action (pinned to a commit SHA).
+      # Notes:
+      # - If CODACY_PROJECT_TOKEN is unavailable (e.g., fork PRs), the action will
+      #   still run tools that support default configs. You will simply see fewer tools.
+      - name: Run Codacy Analysis CLI -> SARIF
+        uses: codacy/codacy-analysis-cli-action@d840f886c4bd4edc059706d09c6a1586111c540b
+        with:
+          project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}  # optional for forks
+          verbose: true
+          output: results.sarif
+          format: sarif
+          gh-code-scanning-compat: true
+          # Keep CI green; let GitHub code scanning + branch rules enforce gating.
+          max-allowed-issues: 2147483647
+
+      # Save SARIF as an artifact so another job (with write perms) can upload it.
+      - name: Upload SARIF artifact (pinned)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codacy-results-sarif
+          path: results.sarif
+          retention-days: 14
+          if-no-files-found: warn   # don't fail if scan produced no file
+
+  # ──────────────────────── Job 2: Upload to Code Scanning ─────────────────────────
+  upload:
+    name: Upload SARIF to GitHub Code Scanning
+    needs: scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    # Only this job can write to the Security tab.
+    permissions:
+      contents: read
+      actions: read            # recommended in some private-repo setups
+      security-events: write   # required to upload SARIF
+
+    steps:
+      - name: Harden runner (egress audit)
+        uses: step-security/harden-runner@f4a75cfd619ee5ce8d5b864b0d183aff3c69b55a # v2.13.1
+        with:
+          egress-policy: audit
+
+      # Pull the SARIF artifact created by the scan job.
+      - name: Download SARIF artifact (pinned)
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: codacy-results-sarif
+          path: sarif
+
+      # Upload SARIF to the Security tab. The conditional guard avoids a "no file" failure.
+      - name: Upload SARIF (pinned)
+        if: ${{ hashFiles('sarif/results.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@192325c86100d080feab897ff886c34abd4c83a3 # v3.30.3
+        with:
+          sarif_file: sarif/results.sarif
